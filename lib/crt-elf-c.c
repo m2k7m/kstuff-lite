@@ -17,12 +17,19 @@ uint64_t _start(void* dlsym, int master, int victim, uint64_t pktopts, uint64_t 
 intptr_t (*kstuff_dynlib_resolve)(int pid, uint32_t handle, const char* nid);
 int (*kstuff_dynlib_handle)(int pid, const char* name, uint32_t* handle);
 kstuff_shellcore_imports_fn kstuff_shellcore_imports;
+uint64_t kstuff_boot_config;
 
 void elf_main(struct specter_args* args, uint64_t resolver_magic,
               intptr_t (*resolver)(int, uint32_t, const char*),
               int (*handle_lookup)(int, const char*, uint32_t*),
-              kstuff_shellcore_imports_fn import_lookup)
+              kstuff_shellcore_imports_fn import_lookup,
+              uint64_t boot_config)
 {
+    /*
+     * Published unconditionally: main() may be entered without the resolver
+     * magic (older loader), and the switch files must still be honoured.
+     */
+    kstuff_boot_config = boot_config;
     if(resolver_magic == KSTUFF_DYNLIB_RESOLVER_MAGIC)
     {
         kstuff_dynlib_resolve = resolver;

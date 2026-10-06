@@ -15,7 +15,10 @@
 #include "../gdb_stub/dbg.h"
 #include "uelf/structs.h"
 #include "uelf/shared_area.h"
+#include "../lib/r0gdb-bootstrap.h"
 #include "../lib/shellcore-imports.h"
+
+extern uint64_t kstuff_boot_config;
 
 void* dlsym(void*, const char*);
 void* memcpy(void * __restrict, const void * __restrict, size_t);
@@ -597,6 +600,12 @@ struct shellcore_patch
     uint64_t offset;
     char* data;
     size_t sz;
+    /*
+     * Bitmask of KSTUFF_PATCH_GROUP_*. 0 (the default for every table that
+     * omits the field) means the patch is unconditional and can never be
+     * skipped by /data/.kstuff_patchmask. See lib/r0gdb-bootstrap.h.
+     */
+    uint16_t group;
 };
 
 /*
@@ -760,8 +769,29 @@ extern const unsigned char ppr_mount_940_blob_end[];
 #define SHELLCORE_PPR_UMOUNT_MARKER       0x315550504B504746ull
 #define SHELLCORE_FPKG_WRAPPER_MAP_SIZE   0x4000
 #define SHELLCORE_LOCKED_PAGE_CAP         128
+/*
+ * Largest patch payload across every firmware table is 14 bytes (the
+ * ps4_nongame_mini cluster at 0x254881); 32 leaves headroom.
+ */
+#define KSTUFF_SHELLCORE_PATCH_MAX_SZ     32
 
 static const char* shellcore_patch_failure;
+
+/*
+ * Result of the last patch_shellcore() run, reported on screen at boot so the
+ * active switch state is visible without pulling a coredump.
+ */
+static uint32_t shellcore_patches_applied;
+static uint32_t shellcore_patches_skipped;
+static uint32_t shellcore_patches_write_failed;
+static uint32_t shellcore_patch_groups_applied;
+static int shellcore_fpkg_hook_installed;
+/*
+ * Resolved once in main() from the loader-supplied switch state. Gates both the
+ * ShellCore-only sysentvec clone and the FPKG/PPR GOT hook, which between them
+ * redirect ShellCore's ioctl/nmount/unmount through the uelf.
+ */
+static int shellcore_fpkg_hook_enabled;
 
 static int shellcore_ppr_fail(const char* reason)
 {
@@ -1243,7 +1273,34 @@ enum kit_type kit = get_kit_type();
 static int patch_shellcore(const struct shellcore_patch* patches, size_t n_patches, uint64_t eh_frame_offset)
 {
     shellcore_patch_failure = 0;
-    int install_fpkg_hook = patches != 0;
+    /*
+     * install_fpkg_hook used to be implied by "we have a patch table". The two
+     * are now independent so /data/.kstuff_no_fpkghook can turn off the ShellCore
+     * GOT hijack and sysentvec clone while leaving code patches in place (and
+     * vice versa) for bisecting.
+     */
+    int install_fpkg_hook = shellcore_fpkg_hook_enabled;
+    uint32_t skip_groups = kstuff_boot_cfg_patch_mask(kstuff_boot_config);
+    int skip_all = !!(kstuff_boot_cfg_flags(kstuff_boot_config)
+                      & KSTUFF_BOOT_CFG_NO_SHELLCORE_PATCHES);
+    if(skip_all)
+    {
+        /*
+         * Group 0 entries are unconditional by design, so "skip everything" has
+         * to drop the table rather than widen the mask. Count them so the boot
+         * report still shows a non-zero skipped number.
+         */
+        shellcore_patches_skipped = n_patches;
+        n_patches = 0;
+    }
+    else
+    {
+        shellcore_patches_skipped = 0;
+    }
+    shellcore_patches_applied = 0;
+    shellcore_patches_write_failed = 0;
+    shellcore_patch_groups_applied = 0;
+    shellcore_fpkg_hook_installed = 0;
     if(install_fpkg_hook && (!kstuff_dynlib_handle || !kstuff_dynlib_resolve
                          || !kstuff_shellcore_imports))
         return shellcore_ppr_fail("fpkg scope: SDK resolver unavailable");
@@ -1274,16 +1331,45 @@ static int patch_shellcore(const struct shellcore_patch* patches, size_t n_patch
 
     for(size_t i = 0; i < n_patches; i++)
     {
+        /* Placeholder entries (empty kit tables) are no-ops, not writes. */
+        if(!patches[i].data || !patches[i].sz)
+        {
+            shellcore_patches_skipped++;
+            continue;
+        }
+        /* A group of 0 is unconditional and never masked out. */
+        if(patches[i].group && (patches[i].group & skip_groups))
+        {
+            shellcore_patches_skipped++;
+            continue;
+        }
         if(lock_shellcore_range(pid, shellcore_base + patches[i].offset,
                                 patches[i].sz, &locked))
             return -1;
         if(phys_copyin(shellcore_base + patches[i].offset, patches[i].data, patches[i].sz, dmap, cr3))
             return -1;
+        /*
+         * Read the bytes back. This catches a write that did not land (locked
+         * page not made writable, bad cr3/dmap); it cannot detect a wrong
+         * offset, which would need the original bytes from SceShellCore.elf.
+         */
+        unsigned char readback[KSTUFF_SHELLCORE_PATCH_MAX_SZ];
+        if(patches[i].sz <= sizeof(readback)
+        && phys_copyout(readback, shellcore_base + patches[i].offset,
+                        patches[i].sz, dmap, cr3)
+        && !shellcore_bytes_equal(readback,
+                                  (const unsigned char*)patches[i].data,
+                                  patches[i].sz))
+            shellcore_patches_write_failed++;
+        shellcore_patches_applied++;
+        shellcore_patch_groups_applied |= patches[i].group;
     }
     if(install_fpkg_hook
     && install_shellcore_ppr_hook(pid, shellcore_base, text_end,
                                   dmap, cr3, &locked))
         return -1;
+    if(install_fpkg_hook)
+        shellcore_fpkg_hook_installed = 1;
     return 0;
 }
 
@@ -1315,8 +1401,21 @@ uint64_t bench(void)
 #define INT1_IST_INDEX 4
 #define INT3_IST_INDEX 7
 
-int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
+int main(void* ds, int a, int b, uintptr_t c, uintptr_t d, uint64_t boot_config)
 {
+    /*
+     * Two paths can reach main():
+     *  - via lib/crt-elf-c.c elf_main(), which publishes kstuff_boot_config
+     *    and then calls _start() with 5 args, so boot_config here is junk;
+     *  - via the crt-elf.asm _start trampoline, which tail-jumps straight to
+     *    main and so preserves the loader's register arguments.
+     * elf_main's publish is authoritative because it is also what installs
+     * the resolver callbacks; when those are missing elf_main did not run and
+     * the sixth register argument is the only place the switches can be.
+     */
+    if(!kstuff_dynlib_resolve)
+        kstuff_boot_config = boot_config;
+
     snprintf = dlsym((void*)0x2, "snprintf");
 
     if(r0gdb_init(ds, a, b, c, d))
@@ -1351,6 +1450,13 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         return 1;
 #endif
     }
+    /*
+     * The FPKG/PPR interception is opt-out via /data/.kstuff_no_fpkghook and is
+     * independent of the code-patch table, so either can be disabled alone.
+     */
+    shellcore_fpkg_hook_enabled = shellcore_patches != 0
+        && !(kstuff_boot_cfg_flags(kstuff_boot_config)
+             & KSTUFF_BOOT_CFG_NO_FPKG_HOOK);
 #ifdef FIRMWARE_PORTING
     dbg_enter();
 #endif
@@ -1661,15 +1767,23 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
     uint64_t fake_sysentvec_for_shellcore = (uint64_t)kmalloc(0x500);
     copyin(fake_sysentvec_for_shellcore, fake_shellcore_sysentvec, 0x500);
 
-    int shellcore_pid = find_proc("SceShellCore");
-    if (shellcore_pid <= 0)
-        die();
+    /*
+     * ShellCore's private sysentvec is only useful to the FPKG/PPR hook. Leaving
+     * it installed with the hook disabled would send ioctl/nmount/unmount into
+     * a uelf path nothing services, so it goes away with the hook.
+     */
+    if (shellcore_fpkg_hook_enabled)
+    {
+        int shellcore_pid = find_proc("SceShellCore");
+        if (shellcore_pid <= 0)
+            die();
 
-    uint64_t shellcore_proc = kernel_get_proc(shellcore_pid);
-    if (!shellcore_proc)
-        die();
+        uint64_t shellcore_proc = kernel_get_proc(shellcore_pid);
+        if (!shellcore_proc)
+            die();
 
-    copyin(shellcore_proc + offsets.p_sysent, &fake_sysentvec_for_shellcore, 8);
+        copyin(shellcore_proc + offsets.p_sysent, &fake_sysentvec_for_shellcore, 8);
+    }
 #else
     copyin(offsets.sysentvec + 14, &(const uint16_t[1]){0xdeb7}, 2); //native sysentvec
     copyin(offsets.sysentvec_ps4 + 14, &(const uint16_t[1]){0xdeb7}, 2); //ps4 sysentvec
@@ -1705,9 +1819,30 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
                                "Retail";
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "Welcome To Kstuff Lite 1.11\nPlayStation 5 FW: %x.%02x (%s)\nBy sleirsgoevy",
+    snprintf(msg, sizeof(msg), "Welcome To Kstuff Lite 1.11-test0\nPlayStation 5 FW: %x.%02x (%s)\nBy sleirsgoevy",
              fwver >> 8, fwver & 0xFF, console_type);
     notify(msg);
+
+    /*
+     * Runtime switch state. The loader prints the same thing to klog; this is
+     * the on-screen copy so a bisect run is self-documenting.
+     */
+    snprintf(msg, sizeof(msg), "kstuff switches: sc_patches %s, fpkg_hook %s, applied %u, skipped %u, groups %03x",
+             (kstuff_boot_cfg_flags(kstuff_boot_config) & KSTUFF_BOOT_CFG_NO_SHELLCORE_PATCHES)
+                 ? "OFF" : "ON",
+             shellcore_fpkg_hook_installed ? "ON" : "OFF",
+             shellcore_patches_applied,
+             shellcore_patches_skipped,
+             shellcore_patch_groups_applied);
+    notify(msg);
+
+    if(shellcore_patches_write_failed)
+    {
+        snprintf(msg, sizeof(msg),
+                 "kstuff: WARNING %u shellcore patch write(s) did not verify",
+                 shellcore_patches_write_failed);
+        notify(msg);
+    }
 	
     return 0;
 #endif

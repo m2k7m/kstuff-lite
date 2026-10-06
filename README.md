@@ -126,6 +126,77 @@ because the scratch buffer is not guaranteed to contain the same owner's
 previous state. An unusable configuration disables FPU entry cleanly instead
 of overflowing the buffer or executing an unsupported instruction.
 
+## Runtime switches
+
+Every switch below is a plain file under `/data`, read once at loader startup.
+No rebuild is needed: write the file, reboot, then read the result from `klog`
+and from the on-screen notification. **A missing file means "enabled"**, so a
+build with no switch files behaves exactly as before.
+
+| Path | Effect |
+| --- | --- |
+| `/data/.kstuff_noautomount` | Skip the `/system_ex` `MNT_UPDATE` remount and all `/user/app/*/mount.lnk` title mounts. |
+| `/data/.kstuff_no_fpkghook` | Skip the ShellCore FPKG/PPR GOT hijack **and** the ShellCore-only `sysentvec` clone (which routes its `ioctl`/`nmount`/`unmount` through the UELF). |
+| `/data/.kstuff_no_shellcore_patches` | Skip every ShellCore code patch in the selected firmware table. |
+| `/data/.kstuff_no_appdb` | Skip the `app.db` DRM-trigger patch. |
+| `/data/.kstuff_patchmask` | Text file holding a hex bitmask of patch **groups to skip**. |
+
+These exist so a suspicious ShellCore patch or mount hook can be bisected on a
+console in minutes instead of one CI build per experiment.
+
+### Patch group mask
+
+`struct shellcore_patch` carries a `group` bitmask. A `group` of `0` means the
+patch is unconditional and is never masked out — which is what every firmware
+table that omits the field gets, so unannotated firmware behaves exactly as
+before. Only annotated tables can be masked.
+
+| Mask | Group | Covers |
+| --- | --- | --- |
+| `0x001` | `SYSVER` | firmware version-check cluster |
+| `0x002` | `UNK1` | three unconditional `eb 04` patches |
+| `0x004` | `UNK2` | four misc 1–4 byte patches |
+| `0x008` | `PS4MINI` | SELF lazy loading / `ps4_nongame_mini` |
+| `0x010` | `RIF` | `sceRifManagerRegisterActivationCallback` stub |
+| `0x020` | `VR` | VR and VR2 update bypass |
+| `0x040` | `SYSVPATH` | `getSceSysDirPath` debug path |
+| `0x080` | `TROPHY` | trophy unlock fix |
+| `0x100` | `ERRMSG` | suppress game error message |
+| `0x200` | `CATEGORY` | `preLaunchCheck` / category checks |
+| `0x400` | `DISCINST` | PS4/PS5 disc installer bypass |
+| `0x800` | `PKGINST` | PS4/PS5 package installer bypass |
+
+Example — disable only the package-installer patches:
+
+```sh
+echo 800 > /data/.kstuff_patchmask
+```
+
+## Mount and app-teardown diagnostics
+
+A `<TID>-app0-nest` PFS mount that cannot be unmounted is a real hazard: the
+teardown path retries it indefinitely (observed at ~60 attempts/second, each
+logging a `sceSblPfsClearKey` failure) and floods `klog` until the console is
+unusable. The loader now makes that condition observable:
+
+- at startup it enumerates `/system_ex/app/<TID>` and reports each title that
+  exists on the `system_ex` volume, since those are what a `-app0-nest` mount is
+  built from, and separates them from kstuff's own `nullfs` bind mounts;
+- it logs the return value of `remount_system_ex()`, which used to be discarded;
+- it polls `/mnt/sandbox/pfsmnt` roughly every ten seconds and logs
+  `NEST APPEARED` / `NEST GONE` transitions. This runs independently of
+  automount, so it still works with `/data/.kstuff_noautomount` set.
+
+Seeing `NEST APPEARED .../CUSA08519-app0-nest` shortly before a hang is direct
+confirmation that the failure is on that mount.
+
+The patch report (`sc_patches ON/OFF`, `fpkg_hook ON/OFF`, applied/skipped
+counts, applied group mask) is printed both to `klog` and as an on-screen
+notification. Every ShellCore code patch is also read back and compared;
+mismatches are counted and surfaced as a warning notification. Note this
+verifies that a write landed — it cannot detect a wrong patch offset, which
+would require the original bytes from `SceShellCore.elf` for that firmware.
+
 ## prosper0gdb loader handoff
 
 The loader passes prosper0gdb a versioned bootstrap structure containing its

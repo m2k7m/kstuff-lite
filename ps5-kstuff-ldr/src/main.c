@@ -76,6 +76,197 @@ static int automount_disabled(void) {
     return access("/data/.kstuff_noautomount", F_OK) == 0;
 }
 
+/* ------------------------------------------------------------------------
+ * Runtime switches.
+ *
+ * Every one of these is a plain file under /data, read once at startup, so a
+ * bisect run needs no rebuild: write the file, reboot, read klog. Absent files
+ * mean "enabled", which preserves the behaviour of a build without switches.
+ *
+ *   /data/.kstuff_noautomount          skip /system_ex remount + title mounts
+ *   /data/.kstuff_no_fpkghook          skip ShellCore FPKG/PPR GOT hook
+ *   /data/.kstuff_no_shellcore_patches skip all ShellCore code patches
+ *   /data/.kstuff_no_appdb             skip the app.db DRM trigger patch
+ *   /data/.kstuff_patchmask=<hex>      skip listed patch groups
+ * --------------------------------------------------------------------- */
+#define KSTUFF_SWITCH_NO_FPKG_HOOK          "/data/.kstuff_no_fpkghook"
+#define KSTUFF_SWITCH_NO_SHELLCORE_PATCHES  "/data/.kstuff_no_shellcore_patches"
+#define KSTUFF_SWITCH_NO_APPDB              "/data/.kstuff_no_appdb"
+#define KSTUFF_PATCHMASK_PATH               "/data/.kstuff_patchmask"
+
+static bool switch_file_present(const char *path) {
+    return access(path, F_OK) == 0;
+}
+
+static uint32_t read_patch_mask(void) {
+    int fd = open(KSTUFF_PATCHMASK_PATH, O_RDONLY);
+    if(fd < 0)
+        return 0;
+    char buf[32] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if(n <= 0)
+        return 0;
+    uint32_t mask = (uint32_t)strtoul(buf, NULL, 0);
+    return mask & KSTUFF_PATCH_GROUP_ALL;
+}
+
+static uint64_t build_boot_config(void) {
+    uint64_t cfg = 0;
+    if(switch_file_present(KSTUFF_SWITCH_NO_FPKG_HOOK))
+        cfg |= KSTUFF_BOOT_CFG_NO_FPKG_HOOK;
+    if(switch_file_present(KSTUFF_SWITCH_NO_SHELLCORE_PATCHES))
+        cfg |= KSTUFF_BOOT_CFG_NO_SHELLCORE_PATCHES;
+    cfg |= (uint64_t)read_patch_mask() << KSTUFF_BOOT_CFG_PATCH_MASK_SHIFT;
+    return cfg;
+}
+
+static void log_switch_state(uint64_t cfg) {
+    klog_printf("switches: automount %s, appdb %s, sc_patches %s, fpkg_hook %s, patchmask 0x%03x\n",
+                automount_disabled()        ? "OFF" : "ON",
+                switch_file_present(KSTUFF_SWITCH_NO_APPDB) ? "OFF" : "ON",
+                (kstuff_boot_cfg_flags(cfg) & KSTUFF_BOOT_CFG_NO_SHELLCORE_PATCHES) ? "OFF" : "ON",
+                (kstuff_boot_cfg_flags(cfg) & KSTUFF_BOOT_CFG_NO_FPKG_HOOK) ? "OFF" : "ON",
+                kstuff_boot_cfg_patch_mask(cfg));
+}
+
+/* ------------------------------------------------------------------------
+ * Mount diagnostics.
+ *
+ * A "<TID>-app0-nest" pfs mount that cannot be unmounted (sceSblPfsClearKey
+ * returns -2, the kernel then retries forever at ~60Hz and floods klog) is
+ * what turns a crashed SceShellCore into a black screen. These census helpers
+ * make that condition visible instead of only in a post-mortem klog.
+ *
+ * The nest mount only appears once a title launches, which is well after
+ * kstuff boots, so the caller polls this and logs transitions rather than
+ * sampling once.
+ * --------------------------------------------------------------------- */
+#define KSTUFF_NEST_SNAPSHOT_MAX 8
+#define KSTUFF_NEST_NAME_MAX     64
+
+/* Fills out[] with the "<TID>-app0-nest" mount names currently present.
+ * Returns how many were written. */
+static unsigned int collect_nest_mounts(char out[][KSTUFF_NEST_NAME_MAX],
+                                         unsigned int cap)
+{
+    const char *root = "/mnt/sandbox/pfsmnt";
+    unsigned int found = 0;
+    DIR *dir = opendir(root);
+    if(!dir)
+        return 0;
+    struct dirent *ent;
+    while((ent = readdir(dir)) && found < cap)
+    {
+        if(ent->d_name[0] == '.' || !strstr(ent->d_name, "-nest"))
+            continue;
+        snprintf(out[found], KSTUFF_NEST_NAME_MAX, "%s", ent->d_name);
+        found++;
+    }
+    closedir(dir);
+    return found;
+}
+
+static void log_system_ex_overlays(void) {
+    const char *root = "/system_ex/app";
+    DIR *dir = opendir(root);
+    if(!dir) {
+        klog_printf("system_ex census: %s unreadable (%s)\n", root, strerror(errno));
+        return;
+    }
+    unsigned int dirs = 0, mounted = 0;
+    struct dirent *ent;
+    while((ent = readdir(dir))) {
+        if(strlen(ent->d_name) != 9)
+            continue;
+        char path[PATH_MAX];
+        struct statfs sfs;
+        snprintf(path, sizeof(path), "%s/%s", root, ent->d_name);
+        if(statfs(path, &sfs) != 0)
+            continue;
+        if(sfs.f_fstypename[0] == 0)
+            continue;
+        if(strcmp(sfs.f_fstypename, "nullfs") == 0) {
+            mounted++;
+            klog_printf("system_ex census: %s -> %s (nullfs, kstuff bind)\n",
+                        ent->d_name, sfs.f_fstypename);
+        } else {
+            dirs++;
+            klog_printf("system_ex census: %s present on the system_ex volume"
+                        " [fstype=%s] -> expects a %s-app0-nest mount\n",
+                        ent->d_name, sfs.f_fstypename, ent->d_name);
+        }
+    }
+    closedir(dir);
+    klog_printf("system_ex census: %u volume overlay(s), %u kstuff bind mount(s)\n",
+                dirs, mounted);
+}
+
+static void log_initial_mount_state(void) {
+    const char *root = "/mnt/sandbox/pfsmnt";
+    struct statfs sfs;
+    if(statfs(root, &sfs) != 0) {
+        klog_printf("mount census: %s unreadable (%s)\n", root, strerror(errno));
+    } else {
+        DIR *dir = opendir(root);
+        if(!dir) {
+            klog_printf("mount census: %s opendir failed (%s)\n", root, strerror(errno));
+        } else {
+            unsigned int total = 0;
+            struct dirent *ent;
+            while((ent = readdir(dir))) {
+                if(ent->d_name[0] == '.')
+                    continue;
+                char path[PATH_MAX];
+                snprintf(path, sizeof(path), "%s/%s", root, ent->d_name);
+                if(statfs(path, &sfs) == 0)
+                    total++;
+            }
+            closedir(dir);
+            klog_printf("mount census: %u app mount(s) at boot\n", total);
+        }
+    }
+
+    if(statfs("/app_temp0", &sfs) == 0)
+        klog_printf("mount census: /app_temp0 present [fstype=%s]\n", sfs.f_fstypename);
+}
+
+/*
+ * Logs "<TID>-app0-nest appears/disappears" transitions. Seeing
+ * "CUSA08519-app0-nest appears" a couple of seconds before the console hangs is
+ * the direct confirmation that the teardown failure is on that mount.
+ */
+static void poll_nest_mount_transitions(char prev[][KSTUFF_NEST_NAME_MAX],
+                                        unsigned int *prev_count)
+{
+    char now[KSTUFF_NEST_SNAPSHOT_MAX][KSTUFF_NEST_NAME_MAX];
+    unsigned int now_count = collect_nest_mounts(now, KSTUFF_NEST_SNAPSHOT_MAX);
+
+    for(unsigned int i = 0; i < now_count; i++) {
+        bool seen = false;
+        for(unsigned int j = 0; j < *prev_count; j++)
+            if(strcmp(prev[j], now[i]) == 0) { seen = true; break; }
+        if(!seen) {
+            char path[PATH_MAX];
+            struct statfs sfs;
+            snprintf(path, sizeof(path), "/mnt/sandbox/pfsmnt/%s", now[i]);
+            klog_printf("mount census: NEST APPEARED %s [fstype=%s]\n",
+                        path, statfs(path, &sfs) == 0 ? sfs.f_fstypename : "?");
+        }
+    }
+    for(unsigned int i = 0; i < *prev_count; i++) {
+        bool gone = true;
+        for(unsigned int j = 0; j < now_count; j++)
+            if(strcmp(now[j], prev[i]) == 0) { gone = false; break; }
+        if(gone)
+            klog_printf("mount census: NEST GONE %s\n", prev[i]);
+    }
+
+    for(unsigned int i = 0; i < now_count && i < KSTUFF_NEST_SNAPSHOT_MAX; i++)
+        snprintf(prev[i], KSTUFF_NEST_NAME_MAX, "%s", now[i]);
+    *prev_count = now_count;
+}
+
 static int mount_source(const char* src_path, char* out_mounted_path,
                         bool* out_temporary_mount)
 {
@@ -406,8 +597,22 @@ static void monitor_usb_changes(void) {
     bool automount_active = false;
     bool scan_pending = false;
     bool disabled_logged = false;
+    char nest_prev[KSTUFF_NEST_SNAPSHOT_MAX][KSTUFF_NEST_NAME_MAX] = {{0}};
+    unsigned int nest_prev_count = 0;
+    unsigned int nest_poll_ticks = 0;
 
     while (1) {
+        /*
+         * Poll for "<TID>-app0-nest" mounts independently of automount, so this
+         * still runs when /data/.kstuff_noautomount is set. The monitor loop
+         * turns roughly once a second; every 10s is enough to catch a nest
+         * mount appearing long before a teardown hang.
+         */
+        if (++nest_poll_ticks >= 10) {
+            nest_poll_ticks = 0;
+            poll_nest_mount_transitions(nest_prev, &nest_prev_count);
+        }
+
         if (automount_disabled()) {
             if (!disabled_logged) {
                 if (kq >= 0) {
@@ -429,8 +634,21 @@ static void monitor_usb_changes(void) {
         if (!automount_active) {
             mounted_mask_valid = mounted_usb_roots(&mounted_mask);
             klog_printf("Remounting /system_ex and mounting titles with image support...\n");
-            remount_system_ex();
-            scan_and_mount_titles();
+            /*
+             * Previously the result was discarded, so a failed or rejected
+             * MNT_UPDATE was invisible. It changes how the system_ex volume is
+             * presented to the app-launch path, so log it either way.
+             */
+            errno = 0;
+            if (remount_system_ex() != 0) {
+                klog_printf("remount_system_ex failed: %s\n", strerror(errno));
+            } else {
+                klog_printf("remount_system_ex ok\n");
+            }
+            errno = 0;
+            if (scan_and_mount_titles() != 0) {
+                klog_printf("scan_and_mount_titles failed: %s\n", strerror(errno));
+            }
             automount_active = true;
         }
 
@@ -523,6 +741,10 @@ pt_load(const void* image, void* base, Elf64_Phdr *phdr) {
 
 int main(void) {
     sceKernelSetProcessName("kstuff.elf");
+    uint64_t boot_config = build_boot_config();
+    log_switch_state(boot_config);
+    log_system_ex_overlays();
+    log_initial_mount_state();
     Elf64_Ehdr *ehdr = (Elf64_Ehdr*)___ps5_kstuff_payload_bin;
     Elf64_Phdr *phdr = (Elf64_Phdr*)(___ps5_kstuff_payload_bin + ehdr->e_phoff);
     void *base = (void*)0x0000000926100000;
@@ -570,7 +792,8 @@ int main(void) {
     void (*entry)(payload_args_t*, uint64_t,
                   intptr_t (*)(int, uint32_t, const char*),
                   int (*)(int, const char*, uint32_t*),
-                  kstuff_shellcore_imports_fn) =
+                  kstuff_shellcore_imports_fn,
+                  uint64_t) =
         base + ehdr->e_entry;
     payload_args_t* args = payload_get_args();
 
@@ -584,10 +807,12 @@ int main(void) {
 
     entry(args, KSTUFF_DYNLIB_RESOLVER_MAGIC,
           kernel_dynlib_resolve, kernel_dynlib_handle,
-          shellcore_import_got);
-    if(*args->payloadout == 0) {
+          shellcore_import_got, boot_config);
+    if(*args->payloadout == 0 && !switch_file_present(KSTUFF_SWITCH_NO_APPDB)) {
         puts("patching app.db");
         *args->payloadout = patch_app_db();
+    } else if(*args->payloadout == 0) {
+        klog_printf("app.db patch skipped by %s\n", KSTUFF_SWITCH_NO_APPDB);
     }
     start_shellui_patch_thread();
 

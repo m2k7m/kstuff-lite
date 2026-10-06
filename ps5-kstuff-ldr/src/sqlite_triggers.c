@@ -2,6 +2,8 @@
 #include <sys/mman.h>
 #include <sqlite3.h>
 
+#include <ps5/klog.h>
+
 
 struct buf
 {
@@ -61,24 +63,40 @@ void log_table_name(struct buf* buf, const unsigned char* name)
 }
 
 //sqlite3_exec
-void run_stmt(sqlite3* db, const char* cmd, struct buf* buf)
+/*
+ * Returns 0 on success, -1 on the first failure. Previously both failure paths
+ * executed ud2, which killed the loader process outright and took the automount
+ * and ShellUI patch threads with it -- and told nobody why.
+ */
+static int run_stmt(sqlite3* db, const char* cmd, struct buf* buf)
 {
+    int applied = 0;
     while(*cmd)
     {
         sqlite3_stmt* stmt;
         const char* tail;
 
         if(sqlite3_prepare_v2(db, cmd, -1, &stmt, &tail) != SQLITE_OK)
-            asm volatile("ud2");
+        {
+            klog_printf("app.db: prepare failed: %s\n", sqlite3_errmsg(db));
+            return -1;
+        }
         cmd = tail;
         int status;
         while((status = sqlite3_step(stmt)) == SQLITE_ROW)
             if(buf)
                 log_table_name(buf, sqlite3_column_text(stmt, 0));
         if(status != SQLITE_DONE)
-            asm volatile("ud2");
+        {
+            klog_printf("app.db: step failed: %s\n", sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            return -1;
+        }
         sqlite3_finalize(stmt);
+        applied++;
     }
+    klog_printf("app.db: %d statement(s) applied\n", applied);
+    return 0;
 }
 
 int patch_app_db(void)
@@ -90,20 +108,39 @@ int patch_app_db(void)
     if(sqlite3_open_v2("/system_data/priv/mms/app.db", &db, SQLITE_OPEN_READWRITE, 0) != SQLITE_OK)
         return -1;
 
-    run_stmt(db, "select tbl_name from sqlite_master where type = 'table';", &buf);
+    if(run_stmt(db, "select tbl_name from sqlite_master where type = 'table';", &buf))
+    {
+        if(buf.data) munmap(buf.data, buf.cap);
+        sqlite3_close(db);
+        return -1;
+    }
     cmd = buf.data;
     if(buf.sz == buf.cap)
     {
         cmd = mmap(0, buf.cap+16384, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+        if(cmd == MAP_FAILED)
+        {
+            munmap(buf.data, buf.cap);
+            sqlite3_close(db);
+            return -1;
+        }
         for(size_t i = 0; i < buf.sz; i++)
             cmd[i] = buf.data[i];
     }
-    run_stmt(db, cmd, 0);
+    if(run_stmt(db, cmd, 0))
+    {
+        if(buf.sz == buf.cap)
+            munmap(cmd, buf.cap+16384);
+        munmap(buf.data, buf.cap);
+        sqlite3_close(db);
+        return -1;
+    }
 
     if(buf.sz == buf.cap)
         munmap(cmd, buf.cap+16384);
 
     munmap(buf.data, buf.cap);
+    sqlite3_close(db);
 
     return 0;
 }
